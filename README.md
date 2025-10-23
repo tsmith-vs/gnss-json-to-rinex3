@@ -22,10 +22,10 @@ https://data.mendeley.com/datasets/nxk9r22wd6/3
 4. The output RINEX files will be in the ./rinex/ directory created by the script
 
 ### Rinex Reader
-The rinex-reader.py file is a simple Python script for validating the header and epochs in the observation files.
+The rinex-reader.py file is a simple Python script for validating the RINEX observation files. By default, the script only validates the header and epochs for time's sake. If you want to also validate the entire RINEX body, simply uncomment the code in the Python script at "3️⃣ Read the data structure".
 
 ##### Usage
-1. `pip install georinex xarray`
+1. `pip install georinex xarray yaspin`
 2. For a single file:
 
     `python3 rinex-reader.py ./rinex/observation12.obs`

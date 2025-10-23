@@ -19,7 +19,51 @@ var (
 	epochs map[string]map[string]any
 )
 
-// ----- small helpers -----
+// ---- strict RINEX-3 observation field sizing ----
+const (
+	obsNumWidth   = 14 // numeric width inside the field
+	obsFieldWidth = 16 // total field width including 2 flag chars
+)
+
+// ---- thresholds for switching to scientific notation ----
+const (
+	prThresh = 7.5e7 // C__: pseudorange
+	phThresh = 5.0e8 // L__: carrier phase (cycles)
+	doThresh = 1.0e6 // D__: Doppler (Hz)
+	snThresh = 2.0e2 // S__: SNR (dB-Hz)
+)
+
+// Fixed precision for normal (fixed-point) printing
+func precFor(prefix string) int {
+	switch prefix {
+	case "cpMes_":
+		return 5 // L__
+	case "prMes_":
+		return 3 // C__
+	case "doMes_":
+		return 3 // D__
+	case "cn0_":
+		return 3 // S__
+	default:
+		return 3
+	}
+}
+
+// Which threshold to use based on the measurement prefix
+func thresholdFor(prefix string) float64 {
+	switch prefix {
+	case "prMes_":
+		return prThresh // C
+	case "cpMes_":
+		return phThresh // L
+	case "doMes_":
+		return doThresh // D
+	case "cn0_":
+		return snThresh // S
+	default:
+		return math.Inf(1)
+	}
+}
 
 // ensure unique PRNs per system (returns indexes to keep, not a new PRN slice)
 func uniqPRNIndexes(prns []int) []int {
@@ -405,26 +449,38 @@ func toInt(v any) (int, bool) {
 	return int(math.Round(f)), true
 }
 
-func fmtObs(val any, prec int) string {
-	if f, ok := toFloat(val); ok {
-		return fmt.Sprintf("%14.*f", prec, f)
+// fmtObs16 prints one observation field in strict RINEX-3 16-char width.
+// It prints the numeric value in 14 columns and appends 2 blanks for LLI/SSI.
+// If v is nil or cannot be parsed, it prints 16 blanks.
+func fmtObs16(prefix string, v any) string {
+	// missing -> full blank field
+	f, ok := toFloat(v)
+	if !ok {
+		return strings.Repeat(" ", obsFieldWidth)
 	}
-	return fmt.Sprintf("%14s", "")
-}
-func precFor(prefix string) int {
-	switch prefix {
-	case "cpMes_":
-		return 5 // phase
-	case "prMes_":
-		return 3 // code
-	case "doMes_":
-		return 3 // Doppler
-	case "cn0_":
-		return 3 // SNR
-	default:
-		return 3
+
+	thr := thresholdFor(prefix)
+	var num string
+	if math.Abs(f) > thr {
+		// scientific: obsNumWidth-wide numeric with exactly 5 decimals
+		num = fmt.Sprintf("%*.*E", obsNumWidth, 5, f)
+	} else {
+		// fixed-point: keep your existing per-type precision
+		num = fmt.Sprintf("%*.*f", obsNumWidth, precFor(prefix), f)
 	}
+
+	// Ensure numeric part is exactly obsNumWidth
+	if len(num) > obsNumWidth {
+		// Rare case (huge exponents). Truncate left to keep right-align.
+		num = num[len(num)-obsNumWidth:]
+	} else if len(num) < obsNumWidth {
+		num = strings.Repeat(" ", obsNumWidth-len(num)) + num
+	}
+
+	// Append 2 characters for LLI and SSI (blanks for now)
+	return num + "  "
 }
+
 func satID(sys rune, prn int) string {
 	return fmt.Sprintf("%c%02d", sys, prn)
 }
@@ -476,7 +532,8 @@ func bandsFor(displaySys rune) []string {
 }
 
 // Observation order per band (C,L,D,S)
-var measPrefixes = []string{"prMes_", "cpMes_", "doMes_", "cn0_"}
+// The dataset mistakenly swapped the Doppler and Carrier Phase variable names, so we manually swap them back here:
+var measPrefixes = []string{"prMes_", "doMes_", "cpMes_", "cn0_"}
 
 // Skip rows where all VS (G,E,B,Q,R) at index j are zero
 func getVSVal(content map[string]any, key string, j int) float64 {
@@ -591,20 +648,20 @@ func writeBody(w io.Writer) error {
 				b.WriteString(satID(dispSys, prn)) // display letter
 				// print CLDS per band
 				for _, band := range bands {
-					sfx := fmt.Sprintf("%c%s", dataSys, band) // data suffix (B or Q if C/J)
-					for _, pref := range measPrefixes {       // "prMes_","cpMes_","doMes_","cn0_"
+					sfx := fmt.Sprintf("%c%s", dataSys, band)
+					for _, pref := range measPrefixes { // {"prMes_", "cpMes_", "doMes_", "cn0_"}
 						key := pref + sfx
 						val, has := content[key]
 						if !has {
-							b.WriteString(fmtObs(nil, precFor(pref)))
+							b.WriteString(fmtObs16(pref, nil)) // blank field
 							continue
 						}
 						row, ok := asSliceAny(val)
 						if !ok || j >= len(row) {
-							b.WriteString(fmtObs(nil, precFor(pref)))
+							b.WriteString(fmtObs16(pref, nil)) // blank field
 							continue
 						}
-						b.WriteString(fmtObs(row[j], precFor(pref)))
+						b.WriteString(fmtObs16(pref, row[j]))
 					}
 				}
 
