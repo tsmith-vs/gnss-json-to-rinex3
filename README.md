@@ -21,4 +21,20 @@ https://data.mendeley.com/datasets/nxk9r22wd6/3
     ^ This loop will list each file present in a /data/ directory and run the script on each file
 4. The output RINEX files will be in the ./rinex/ directory created by the script
 
+### Rinex Reader
+The rinex-reader.py file is a simple Python script for validating the header and epochs in the observation files.
+
+##### Usage
+1. `pip install georinex xarray`
+2. For a single file:
+
+    `python3 rinex-reader.py ./rinex/observation12.obs`
+
+    To convert multiple files:
+
+    `for file in $(ls rinex);do python3 rinex-reader.py rinex/$file; done`
+
+    ^ This loop will parse each file present in the /rinex/ directory
+3. The output shows basic header and epochs info
+
 @tsmith-vs

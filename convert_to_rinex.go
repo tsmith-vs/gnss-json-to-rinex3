@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,7 +19,26 @@ var (
 	epochs map[string]map[string]any
 )
 
-// ---------- helpers ----------
+// ----- small helpers -----
+
+// ensure unique PRNs per system (returns indexes to keep, not a new PRN slice)
+func uniqPRNIndexes(prns []int) []int {
+	seen := make(map[int]struct{}, len(prns))
+	keep := make([]int, 0, len(prns))
+	for idx, p := range prns {
+		if p <= 0 {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue // duplicate PRN found later in the array -> skip this index
+		}
+		seen[p] = struct{}{}
+		keep = append(keep, idx)
+	}
+	// NOTE: do NOT sort indexes here unless you will also permute the
+	// measurement arrays or are okay with breaking the VS alignment.
+	return keep
+}
 
 func headerLine(body, label string) string {
 	if len(body) > 60 {
@@ -57,110 +77,7 @@ func estimateInterval(sortedKeys []string) float64 {
 	return sec
 }
 
-func obsCodeForPrefix(measPrefix string) (string, bool) {
-	switch measPrefix {
-	case "prMes_":
-		return "C", true // Code (pseudorange)
-	case "cpMes_":
-		return "L", true // Phase
-	case "doMes_":
-		return "D", true // Doppler
-	case "cn0_":
-		return "S", true // SNR (dB-Hz)
-	default:
-		return "", false
-	}
-}
-
-// Attribute (3rd char) defaults; tweak to your dataset’s actual signal tags as needed
-func attrFor(system rune, freq string) string {
-	switch system {
-	case 'G':
-		// L1/L2 → C, L5 → X by default
-		if strings.HasPrefix(freq, "5") {
-			return "X"
-		}
-		return "C"
-	case 'E':
-		// Galileo often X for combined pilot+data
-		return "X"
-	case 'R':
-		// GLONASS CA
-		return "C"
-	case 'B', 'Q':
-		// BeiDou/QZSS legacy signals frequently I
-		return "I"
-	default:
-		return "C"
-	}
-}
-
-// Build dynamic sys->[]obsTypes from a single epoch (usually the first). If you want
-// to union across *all* epochs, iterate all and accumulate instead of only first.
-func buildSysObsTypes(firstContent map[string]any) map[rune][]string {
-	type bandInfo struct {
-		band string
-		meas map[string]bool // letters: C/L/D/S present on this band
-	}
-	sysBands := map[rune]map[string]*bandInfo{}
-
-	add := func(sys rune, band, letter string) {
-		if sysBands[sys] == nil {
-			sysBands[sys] = map[string]*bandInfo{}
-		}
-		if sysBands[sys][band] == nil {
-			sysBands[sys][band] = &bandInfo{band: band, meas: map[string]bool{}}
-		}
-		sysBands[sys][band].meas[letter] = true
-	}
-
-	for key := range firstContent {
-		idx := strings.Index(key, "_")
-		if idx <= 0 || idx+1 >= len(key) {
-			continue
-		}
-		prefix := key[:idx+1] // "prMes_", etc.
-		sfx := key[idx+1:]    // "G1", "R1", "E5", "B1", "Q2", ...
-		if len(sfx) < 2 {
-			continue
-		}
-		sys := rune(sfx[0])
-		freq := sfx[1:] // "1","2","5","5X",...
-
-		letter, ok := obsCodeForPrefix(prefix)
-		if !ok {
-			continue
-		}
-		add(sys, freq, letter)
-	}
-
-	// Order within a band; CHANGE HERE if your body writes in a different order:
-	orderMeas := []string{"C", "L", "D", "S"} // canonical RINEX order
-
-	sysToTypes := map[rune][]string{}
-	for sys, bands := range sysBands {
-		// sort bands (lexicographically works for e.g. "1","2","5","5X")
-		bandKeys := make([]string, 0, len(bands))
-		for b := range bands {
-			bandKeys = append(bandKeys, b)
-		}
-		sort.Strings(bandKeys)
-
-		var types []string
-		for _, b := range bandKeys {
-			attr := attrFor(sys, b)
-			for _, m := range orderMeas {
-				if bands[b].meas[m] {
-					types = append(types, m+b+attr) // e.g. C1C, L1C...
-				}
-			}
-		}
-		sysToTypes[sys] = types
-	}
-	return sysToTypes
-}
-
-// Format SYS/#/OBS TYPES lines, splitting every 13 types per line
+// Format SYS/#/OBS TYPES lines (up to 13 types per line)
 func formatSysObsTypesLines(sys rune, types []string) string {
 	if len(types) == 0 {
 		return ""
@@ -168,7 +85,7 @@ func formatSysObsTypesLines(sys rune, types []string) string {
 	const maxPerLine = 13
 	var sb strings.Builder
 
-	writeChunk := func(start, firstIdx int, first bool) {
+	writeChunk := func(start int, first bool) {
 		end := start + maxPerLine
 		if end > len(types) {
 			end = len(types)
@@ -176,7 +93,6 @@ func formatSysObsTypesLines(sys rune, types []string) string {
 		chunk := types[start:end]
 
 		if first {
-			// sys in col1, count in cols 4-6 (3-wide, right‑justified)
 			body := fmt.Sprintf("%c%3d ", sys, len(types))
 			for i, t := range chunk {
 				if i == 0 {
@@ -187,7 +103,6 @@ func formatSysObsTypesLines(sys rune, types []string) string {
 			}
 			sb.WriteString(headerLine(body, "SYS / # / OBS TYPES"))
 		} else {
-			// continuation line: sys in col1, then 4 blanks
 			body := fmt.Sprintf("%c    ", sys)
 			for i, t := range chunk {
 				if i == 0 {
@@ -200,23 +115,107 @@ func formatSysObsTypesLines(sys rune, types []string) string {
 		}
 	}
 
-	// first line
-	writeChunk(0, 0, true)
-	// continuations
+	writeChunk(0, true)
 	for i := maxPerLine; i < len(types); i += maxPerLine {
-		writeChunk(i, i, false)
+		writeChunk(i, false)
 	}
 	return sb.String()
 }
 
-// ---------- main header builder ----------
+// Build the exact observation type lists you requested.
+// Order is C, L, D, S per band, and bands are the ones you specified.
+func fixedSysObsTypes() map[rune][]string {
+	return map[rune][]string{
+		'G': {"C1C", "L1C", "D1C", "S1C", "C2C", "L2C", "D2C", "S2C"},
+		'R': {"C1C", "L1C", "D1C", "S1C", "C2C", "L2C", "D2C", "S2C"},
+		'E': {"C1X", "L1X", "D1X", "S1X", "C7X", "L7X", "D7X", "S7X"},
+		// B is printed as C (BeiDou), with bands 2 and 7 using X attribute:
+		'C': {"C2X", "L2X", "D2X", "S2X", "C7X", "L7X", "D7X", "S7X"},
+		// Q is printed as J (QZSS), with 1 and 2 (L2X attribute by your sample):
+		'J': {"C1C", "L1C", "D1C", "S1C", "C2X", "L2X", "D2X", "S2X"},
+	}
+}
 
-func getHeaderDynamic() (string, error) {
+// --- GLONASS SLOT / FRQ # section ---
+// slots is a map: PRN -> frequency channel (e.g., 1:-7..+6)
+// Lines carry up to 8 pairs per line, matching typical practice.
+func formatGlonassSlotFreqLines(slots map[int]int) string {
+	if len(slots) == 0 {
+		return "" // nothing to print
+	}
+	type pair struct{ prn, chanN int }
+	pairs := make([]pair, 0, len(slots))
+	for prn, ch := range slots {
+		pairs = append(pairs, pair{prn, ch})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].prn < pairs[j].prn })
+
+	const pairsPerLine = 8
+	var sb strings.Builder
+
+	// First line starts with the count (right‑justified in 3 columns)
+	writeLine := func(start int, first bool) {
+		end := start + pairsPerLine
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		chunk := pairs[start:end]
+
+		var body string
+		if first {
+			body = fmt.Sprintf("%3d", len(pairs))
+		} else {
+			body = "   " // 3 spaces align with first line's count field
+		}
+		// Append pairs: " Rnn  cc"
+		for _, p := range chunk {
+			body += fmt.Sprintf(" R%02d %2d", p.prn, p.chanN)
+		}
+		sb.WriteString(headerLine(body, "GLONASS SLOT / FRQ #"))
+	}
+
+	writeLine(0, true)
+	for i := pairsPerLine; i < len(pairs); i += pairsPerLine {
+		writeLine(i, false)
+	}
+	return sb.String()
+}
+
+// --- SYS / PHASE SHIFT section ---
+// shifts: map[system]map[obsType]value, e.g. shifts['G']["L1C"]=0.0
+// One header line per (system, obsType).
+func formatSysPhaseShiftLines(shifts map[rune]map[string]float64) string {
+	if len(shifts) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	// Deterministic order: system G,R,E,C,J then obs types sorted lexicographically
+	sysOrder := []rune{'G', 'R', 'E', 'C', 'J'}
+	for _, sys := range sysOrder {
+		m, ok := shifts[sys]
+		if !ok || len(m) == 0 {
+			continue
+		}
+		types := make([]string, 0, len(m))
+		for t := range m {
+			types = append(types, t)
+		}
+		sort.Strings(types)
+		for _, t := range types {
+			val := m[t]
+			body := fmt.Sprintf("%c %-3s %9.5f", sys, t, val)
+			sb.WriteString(headerLine(body, "SYS / PHASE SHIFT"))
+		}
+	}
+	return sb.String()
+}
+
+// The header using fixed SYS/OBS_TYPES and dynamic first/last and interval.
+func getHeaderFixed() (string, error) {
 	if len(epochs) == 0 {
-		return "", fmt.Errorf("no epochs available to build header")
+		return "", fmt.Errorf("no epochs available")
 	}
 	keys := sortedEpochKeys()
-
 	firstTS, err := parseEpoch(keys[0])
 	if err != nil {
 		return "", fmt.Errorf("parse first epoch %q: %w", keys[0], err)
@@ -227,35 +226,27 @@ func getHeaderDynamic() (string, error) {
 	}
 	intervalSec := estimateInterval(keys)
 
-	// Build observation type sets from first epoch (or union over all, if you prefer)
-	sysToTypes := buildSysObsTypes(epochs[keys[0]])
-
-	orderSys := []rune{'G', 'R', 'E', 'B', 'Q'}
+	sysToTypes := fixedSysObsTypes()
+	orderSys := []rune{'G', 'R', 'E', 'C', 'J'}
 
 	var hdr strings.Builder
-	// RINEX VERSION / TYPE
-	hdr.WriteString(headerLine("3.04           OBSERVATION DATA    M: MIXED", "RINEX VERSION / TYPE"))
-	// PGM / RUN BY / DATE
+	hdr.WriteString(headerLine("     3.04           OBSERVATION DATA    M: MIXED", "RINEX VERSION / TYPE"))
 	hdr.WriteString(headerLine(
 		fmt.Sprintf("%-20s%-20s%-20s", "gnss-json-to-rinex3", "User", time.Now().UTC().Format("20060102 150405 UTC")),
 		"PGM / RUN BY / DATE",
 	))
-	// Optional COMMENT
 	hdr.WriteString(headerLine("Generated automatically from JSON observations", "COMMENT"))
 
-	// Dynamic SYS/#/OBS TYPES
 	for _, sys := range orderSys {
 		if types := sysToTypes[sys]; len(types) > 0 {
 			hdr.WriteString(formatSysObsTypesLines(sys, types))
 		}
 	}
 
-	// SIGNAL STRENGTH UNIT
 	hdr.WriteString(headerLine("DBHZ", "SIGNAL STRENGTH UNIT"))
-	// INTERVAL
 	hdr.WriteString(headerLine(fmt.Sprintf("%14.3f", intervalSec), "INTERVAL"))
 
-	// TIME OF FIRST / LAST OBS (GPS time system tag is acceptable here if using GPS time)
+	// TIME OF FIRST / LAST OBS (RINEX 3 lines)
 	hdr.WriteString(headerLine(
 		fmt.Sprintf("%6d%6d%6d%6d%6d%13.7f     GPS",
 			firstTS.Year(), int(firstTS.Month()), firstTS.Day(),
@@ -269,9 +260,7 @@ func getHeaderDynamic() (string, error) {
 		"TIME OF LAST OBS",
 	))
 
-	// RCV CLOCK OFFS APPL
 	hdr.WriteString(headerLine("0", "RCV CLOCK OFFS APPL"))
-	// END OF HEADER
 	hdr.WriteString(headerLine("", "END OF HEADER"))
 
 	return hdr.String(), nil
@@ -386,7 +375,8 @@ func createEpochs(path string) {
 }
 
 // Safe type helpers
-// toFloat as used earlier
+func asSliceAny(v any) ([]any, bool) { vv, ok := v.([]any); return vv, ok }
+
 func toFloat(v any) (float64, bool) {
 	switch x := v.(type) {
 	case float64:
@@ -407,18 +397,95 @@ func toFloat(v any) (float64, bool) {
 		return 0, false
 	}
 }
+func toInt(v any) (int, bool) {
+	f, ok := toFloat(v)
+	if !ok {
+		return 0, false
+	}
+	return int(math.Round(f)), true
+}
 
-func asSliceAny(v any) ([]any, bool) { vv, ok := v.([]any); return vv, ok }
+func fmtObs(val any, prec int) string {
+	if f, ok := toFloat(val); ok {
+		return fmt.Sprintf("%14.*f", prec, f)
+	}
+	return fmt.Sprintf("%14s", "")
+}
+func precFor(prefix string) int {
+	switch prefix {
+	case "cpMes_":
+		return 5 // phase
+	case "prMes_":
+		return 3 // code
+	case "doMes_":
+		return 3 // Doppler
+	case "cn0_":
+		return 3 // SNR
+	default:
+		return 3
+	}
+}
+func satID(sys rune, prn int) string {
+	return fmt.Sprintf("%c%02d", sys, prn)
+}
 
-// getVSVal returns the numeric value at index j for a given VS key (e.g., "VSG").
-// Missing key, non-slice, or out-of-bounds -> treated as 0.0.
+// Mapping: display system -> data system rune used in JSON suffixes
+// G->G, R->R, E->E, C->B, J->Q (B is actually C; Q is actually J)
+var displayToDataSys = map[rune]rune{
+	'G': 'G',
+	'R': 'R',
+	'E': 'E',
+	'C': 'B',
+	'J': 'Q',
+}
+
+// VS keys by display sys (mapped to underlying data sys)
+func vsKeyFor(displaySys rune) string {
+	switch displaySys {
+	case 'G':
+		return "VSG"
+	case 'R':
+		return "VSR"
+	case 'E':
+		return "VSE"
+	case 'C': // BeiDou data is under B
+		return "VSB"
+	case 'J': // QZSS data is under Q
+		return "VSQ"
+	default:
+		return ""
+	}
+}
+
+// Bands per display system (printed order), and corresponding data suffix rune
+func bandsFor(displaySys rune) []string {
+	switch displaySys {
+	case 'G':
+		return []string{"1", "2"}
+	case 'R':
+		return []string{"1", "2"}
+	case 'E':
+		return []string{"1", "7"}
+	case 'C': // BeiDou printed as C, but data is B2/B7
+		return []string{"2", "7"}
+	case 'J': // QZSS printed as J, data is Q1/Q2
+		return []string{"1", "2"}
+	default:
+		return nil
+	}
+}
+
+// Observation order per band (C,L,D,S)
+var measPrefixes = []string{"prMes_", "cpMes_", "doMes_", "cn0_"}
+
+// Skip rows where all VS (G,E,B,Q,R) at index j are zero
 func getVSVal(content map[string]any, key string, j int) float64 {
 	raw, ok := content[key]
 	if !ok {
 		return 0
 	}
 	slice, ok := asSliceAny(raw)
-	if !ok || j >= len(slice) || j < 0 {
+	if !ok || j < 0 || j >= len(slice) {
 		return 0
 	}
 	if f, ok := toFloat(slice[j]); ok {
@@ -426,78 +493,35 @@ func getVSVal(content map[string]any, key string, j int) float64 {
 	}
 	return 0
 }
-
-// isAllVSZero returns true if VSG, VSE, VSQ, VSR, and VSB are all zero at index j.
 func isAllVSZero(content map[string]any, j int) bool {
-	vsKeys := []string{"VSG", "VSE", "VSQ", "VSR", "VSB"}
-	for _, k := range vsKeys {
+	for _, k := range []string{"VSG", "VSE", "VSQ", "VSR", "VSB"} {
 		if getVSVal(content, k, j) != 0 {
 			return false
 		}
 	}
 	return true
 }
-func toInt(v any) (int, bool) {
-	f, ok := toFloat(v)
-	if !ok {
-		return 0, false
-	}
-	return int(f + 0.5), true // round
-}
 
-// width=14 fields similar to your example, pick precision per type
-func fmtObs(val any, prec int) string {
-	if f, ok := toFloat(val); ok {
-		return fmt.Sprintf("%14.*f", prec, f)
-	}
-	// missing value → blank field
-	return fmt.Sprintf("%14s", "")
-}
-
-// precision per measurement type
-func precFor(field string) int {
-	switch {
-	case strings.HasPrefix(field, "cpMes"): // carrier phase
-		return 5
-	case strings.HasPrefix(field, "prMes"): // pseudorange
-		return 3
-	case strings.HasPrefix(field, "doMes"): // Doppler
-		return 3
-	case strings.HasPrefix(field, "cn0"): // SNR (dB-Hz)
-		return 3
-	default:
-		return 3
-	}
-}
-
-// Build satellite ID like "G06", "R01", etc.
-func satID(sys rune, prn int) string {
-	return fmt.Sprintf("%c%02d", sys, prn)
-}
-
-// writeBody writes the entire observation body to w using the global `epochs`.
 func writeBody(w io.Writer) error {
-	// --- sort epoch keys
+	// 1) Sort epoch keys
 	keys := make([]string, 0, len(epochs))
 	for ts := range epochs {
 		keys = append(keys, ts)
 	}
 	sort.Strings(keys)
 
+	// Constellation print order
+	sysOrder := []rune{'G', 'R', 'E', 'C', 'J'}
+
+	bw, _ := w.(*bufio.Writer)
+
 	for _, ts := range keys {
-		content := epochs[ts] // map[string]any (per-epoch)
+		content := epochs[ts]
 
-		// discover system->VS key (e.g., 'G'->"VSG")
-		sysToVS := map[rune]string{}
-		for k := range content {
-			if len(k) == 3 && strings.HasPrefix(k, "VS") {
-				sysToVS[rune(k[2])] = k
-			}
-		}
-
-		// build PRN lists per system using VS*
+		// 2) Build PRN slices per system from the VS arrays (do NOT sort)
 		sysPRNs := map[rune][]int{}
-		for sys, vsKey := range sysToVS {
+		for _, dispSys := range sysOrder {
+			vsKey := vsKeyFor(dispSys) // e.g. "VSG", "VSR", "VSE", "VSB", "VSQ"
 			vsVal, ok := content[vsKey]
 			if !ok {
 				continue
@@ -506,98 +530,70 @@ func writeBody(w io.Writer) error {
 			if !ok {
 				continue
 			}
-			prns := make([]int, 0, len(vsSlice))
-			for _, v := range vsSlice {
-				if prn, ok := toInt(v); ok && prn > 0 {
-					prns = append(prns, prn)
-				} else {
-					// keep slot for alignment even if PRN not positive
-					prns = append(prns, 0)
+
+			prns := make([]int, len(vsSlice))
+			for j, v := range vsSlice {
+				if prn, ok := toInt(v); ok {
+					prns[j] = prn
 				}
 			}
-			sysPRNs[sys] = prns
+			sysPRNs[dispSys] = prns
 		}
 
-		// compute total *printable* satellites only after we apply the skip rule
-		// but we need the epoch line's count beforehand. Easiest is:
-		//  1) count printable first,
-		//  2) then print header with that count,
-		//  3) then print rows.
-
-		// discover bands per system (e.g., ["G1","G2"])
-		sysBands := map[rune][]string{}
-		for k := range content {
-			if idx := strings.Index(k, "_"); idx >= 0 && idx+1 < len(k) {
-				sfx := k[idx+1:]
-				if len(sfx) >= 2 {
-					sys := rune(sfx[0])
-					if strings.HasPrefix(k, "prMes_") || strings.HasPrefix(k, "cpMes_") ||
-						strings.HasPrefix(k, "doMes_") || strings.HasPrefix(k, "cn0_") {
-						found := false
-						for _, b := range sysBands[sys] {
-							if b == sfx {
-								found = true
-								break
-							}
-						}
-						if !found {
-							sysBands[sys] = append(sysBands[sys], sfx)
-						}
-					}
-				}
+		// 3) Build the index lists to print (unique PRNs and not all-VS-zero)
+		sysIdxToPrint := map[rune][]int{}
+		totalPrinted := 0
+		for _, dispSys := range sysOrder {
+			prns := sysPRNs[dispSys]
+			if len(prns) == 0 {
+				continue
 			}
-		}
-		for sys := range sysBands {
-			sort.Strings(sysBands[sys])
-		}
 
-		// PREPASS: count rows to print after applying skip rule
-		printCount := 0
-		for _, prns := range sysPRNs {
-			// obtain its slice length for indexing
-			for j := range prns {
-				// Skip this row if all VS* at index j are zero
-				if isAllVSZero(content, j) {
-					continue
-				}
-				// also skip rows where PRN is zero (no satellite)
+			// unique PRNs -> get the indexes we will keep
+			uniqIdx := uniqPRNIndexes(prns)
+
+			// apply your “skip rows with all VS=0” rule per kept index
+			kept := make([]int, 0, len(uniqIdx))
+			for _, j := range uniqIdx {
 				if prns[j] <= 0 {
 					continue
 				}
-				printCount++
+				if isAllVSZero(content, j) {
+					continue
+				}
+				kept = append(kept, j)
 			}
+
+			sysIdxToPrint[dispSys] = kept
+			totalPrinted += len(kept)
 		}
 
-		// write epoch header with final count
-		epochLine := fmt.Sprintf("%s %d", formatObsEpoch(ts), printCount)
+		// 4) Epoch line
+		epochLine := fmt.Sprintf("%s %d", formatObsEpoch(ts), totalPrinted)
 		if _, err := fmt.Fprintln(w, epochLine); err != nil {
 			return err
 		}
 
-		// Now write per-satellite rows (skipping as required)
-		// ### NOTICE: The dataset swaps the column names for the Doppler and Carrier Phase (likely a mistake), ###
-		// ### so instead of the expected CLDS output, we manually use CDLS to ensure RINEX-compliant output:   ###
-		measPrefixes := []string{"prMes_", "doMes_", "cpMes_", "cn0_"}
-		for sys, prns := range sysPRNs {
-			vsKey := sysToVS[sys]
-			vsSlice, _ := asSliceAny(content[vsKey])
+		// 5) Emit rows in G,R,E,C,J order, using the kept indexes (alignment preserved)
+		for _, dispSys := range sysOrder {
+			prns := sysPRNs[dispSys]
+			idxs := sysIdxToPrint[dispSys]
+			if len(idxs) == 0 {
+				continue
+			}
 
-			for j, prn := range prns {
-				// Skip rows where all systems’ VS at j are zero
-				if isAllVSZero(content, j) {
-					continue
-				}
-				// Also skip if this PRN is not valid for the current system
-				if prn <= 0 || j >= len(vsSlice) {
-					continue
-				}
+			dataSys := displayToDataSys[dispSys] // C->B, J->Q mapping for suffixes
+			bands := bandsFor(dispSys)           // e.g. G: ["1","2"], E: ["1","7"], C: ["2","7"] ...
 
+			for _, j := range idxs {
+				prn := prns[j]
 				var b strings.Builder
-				fmt.Fprintf(&b, "%s", satID(sys, prn))
-
-				for _, band := range sysBands[sys] {
-					for _, pref := range measPrefixes {
-						key := pref + band
+				b.WriteString(satID(dispSys, prn)) // display letter
+				// print CLDS per band
+				for _, band := range bands {
+					sfx := fmt.Sprintf("%c%s", dataSys, band) // data suffix (B or Q if C/J)
+					for _, pref := range measPrefixes {       // "prMes_","cpMes_","doMes_","cn0_"
+						key := pref + sfx
 						val, has := content[key]
 						if !has {
 							b.WriteString(fmtObs(nil, precFor(pref)))
@@ -611,13 +607,17 @@ func writeBody(w io.Writer) error {
 						b.WriteString(fmtObs(row[j], precFor(pref)))
 					}
 				}
+
 				if _, err := fmt.Fprintln(w, b.String()); err != nil {
 					return err
 				}
 			}
 		}
-	}
 
+		if bw != nil {
+			_ = bw.Flush()
+		}
+	}
 	return nil
 }
 
@@ -637,7 +637,7 @@ func main() {
 	_, relativeFile := filepath.Split(file)
 	fileName := strings.Split(relativeFile, ".")[0]
 
-	header, err := getHeaderDynamic()
+	header, err := getHeaderFixed()
 	epanic(err)
 
 	//  write to a file
