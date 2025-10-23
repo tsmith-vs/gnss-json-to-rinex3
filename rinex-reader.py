@@ -20,7 +20,8 @@ print(f"\n[###] {input_file}")
 # --- 1️⃣ Parse header ---
 try:
     h = gr.rinexheader(input_file)
-    print(f"[#] Header parsed successfully: Version: {h.get('version', None)}, FileType: {h.get('filetype', None)}, RinexType: {h.get('rinextype', None)}")
+    print(f"[#] Header parsed successfully:")
+    print(f"Version: {h.get('version', None)}, FileType: {h.get('filetype', None)}, RinexType: {h.get('rinextype', None)}")
 except Exception as e:
     print("[-] Error parsing header:", repr(e))
     sys.exit()
@@ -35,14 +36,15 @@ try:
 except Exception as e:
     print("[-] Error extracting time info:", repr(e))
 
+print()
 # # --- 3️⃣ Read the data structure ---
-# try:
-#     with yaspin(text="Parsing body...", color="cyan") as spinner:
-#         ds = gr.load(input_file)
-#         spinner.ok("✔ Done!")
-#         print("[#] Observation data structure loaded successfully.")
-#         print(ds)
-# except Exception as e:
-#     print("[-] Error reading observation data:", repr(e))
+try:
+    with yaspin(text="Parsing body...", color="cyan") as spinner:
+        ds = gr.load(input_file)
+        spinner.ok("✔  Done!")
+        print("\n[#] Observation data structure loaded successfully.")
+        print(ds)
+except Exception as e:
+    print("[-] Error reading observation data:", repr(e))
 
 print()

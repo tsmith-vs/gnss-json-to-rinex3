@@ -1,6 +1,6 @@
 # GNSS JSON to RINEX3 Converter
 
-This script is specially designed to convert the JSON data from the 1221/Processed Data/ folder of the GNSS Dataset (with Interference and Spoofing) Part III found at the link below to RINEX v3.04:
+This script is specially designed to convert the JSON data from the **1221/Processed Data/** folder of the **GNSS Dataset (with Interference and Spoofing) Part III** found at the link below to RINEX v3.04:
 
 https://data.mendeley.com/datasets/nxk9r22wd6/3
 
@@ -37,4 +37,16 @@ The rinex-reader.py file is a simple Python script for validating the RINEX obse
     ^ This loop will parse each file present in the /rinex/ directory
 3. The output shows basic header and epochs info
 
-@tsmith-vs
+### Rinex Mapper
+The rinex-mapper.py file is used for visualizing the doppler data from a RINEX .obs file.
+
+##### Usage
+1. `pip install georinex matplotlib numpy pandas`
+2. For a single file:
+
+    `python3 rinex-mapper.py ./rinex/observation12.obs`
+
+3. The output is a matplotlib graph of the data
+
+
+> @tsmith-vs
